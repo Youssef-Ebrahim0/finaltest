@@ -1,48 +1,74 @@
-import streamlit as st
+iimport streamlit as st
 import cv2
-import mediapipe as mp
 import numpy as np
+import mediapipe as mp
 import tensorflow as tf
+from PIL import Image
+import gdown
 
-# Load model
-letter_model = tf.keras.models.load_model("model_letter.h5")
+# -----------------------------
+# 1. Download model from Drive
+# -----------------------------
+url = "https://drive.google.com/uc?id=1gnqGeqa-tU5WDACv38Az13LZqxYnloEZ"
+output = "my_model.h5"
 
+@st.cache_resource
+def download_and_load_model(url, path):
+    # Download model if not exists
+    gdown.download(url, path, quiet=False)
+    # Load model
+    model = tf.keras.models.load_model(path)
+    return model
+
+model = download_and_load_model(MODEL_DRIVE_LINK, MODEL_PATH)
+
+# -----------------------------
+# 2. Mediapipe setup
+# -----------------------------
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
-st.title("Sign Language Hand Gesture Recognition")
-st.write("Live Letter Prediction Using Mediapipe + Deep Learning")
+hands = mp_hands.Hands(
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
 
-run = st.checkbox("Start Camera")
+# -----------------------------
+# 3. Streamlit UI
+# -----------------------------
+st.title("Real-Time Hand Gesture Recognition")
+st.write("Take a picture or stream frames for gesture prediction:")
 
-if run:
-    cap = cv2.VideoCapture(0)
-    with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.5) as hands:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            frame = cv2.flip(frame, 1)
+# Camera input (single-frame)
+img_file_buffer = st.camera_input("Capture frame")
 
-            results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
-            if results.multi_hand_landmarks:
-                for handLms in results.multi_hand_landmarks:
-                    mp_drawing.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+if img_file_buffer is not None:
+    # Convert to OpenCV image
+    frame = np.array(Image.open(img_file_buffer))
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Extract points
-                landmarks = []
-                for lm in results.multi_hand_landmarks[0].landmark:
-                    landmarks.append([lm.x, lm.y, lm.z])
+    # Mediapipe processing
+    results = hands.process(frame_rgb)
 
-                landmarks = np.array(landmarks).flatten()
-                prediction = letter_model.predict(np.array([landmarks]))
-                pred_letter = chr(np.argmax(prediction) + 65)
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-                cv2.putText(frame, pred_letter, (50,80), cv2.FONT_HERSHEY_SIMPLEX,
-                            2, (255,0,0), 3)
+            # Prepare landmarks for model
+            landmarks = []
+            for lm in hand_landmarks.landmark:
+                landmarks.extend([lm.x, lm.y, lm.z])
+            landmarks = np.array(landmarks).reshape(1, -1)
 
-            st.image(frame, channels="BGR")
+            # Predict gesture
+            prediction = model.predict(landmarks)
+            predicted_class = np.argmax(prediction, axis=1)[0]
 
-    cap.release()
+            st.write(f"Predicted Gesture Class: {predicted_class}")
+
+    st.image(frame, caption='Processed Frame', use_column_width=True)
+
 
 
 # # ui/app.py
