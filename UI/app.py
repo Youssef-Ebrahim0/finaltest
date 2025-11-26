@@ -1,230 +1,193 @@
-iimport streamlit as st
+import streamlit as st
 import cv2
 import numpy as np
+import tempfile
+import time
+from tensorflow.keras.models import load_model
 import mediapipe as mp
-import tensorflow as tf
-from PIL import Image
-import gdown
 
-# -----------------------------
-# 1. Download model from Drive
-# -----------------------------
-url = "https://drive.google.com/uc?id=1gnqGeqa-tU5WDACv38Az13LZqxYnloEZ"
-output = "my_model.h5"
+st.set_page_config(page_title="Hand Gesture Recognition", layout="wide")
 
+st.title("Simple Hand Gesture Recognition — Streamlit")
+st.markdown(
+    "This app uses MediaPipe for hand detection and a Keras model for gesture classification.\n\n" 
+    "Upload your model (.h5) and optionally a labels file (one label per line). Then press `Start` to run the webcam.")
+
+# Sidebar: upload model + labels
+st.sidebar.header("Model & settings")
+model_file = st.sidebar.file_uploader("Upload Keras model (.h5)", type=["h5"], accept_multiple_files=False)
+labels_file = st.sidebar.file_uploader("Upload labels (txt, one per line)", type=["txt"], accept_multiple_files=False)
+input_size = st.sidebar.number_input("Model input size (square)", min_value=32, max_value=512, value=224, step=1)
+conf_threshold = st.sidebar.slider("Confidence threshold (show prediction only if prob >=)", 0.0, 1.0, 0.5, 0.01)
+flip_image = st.sidebar.checkbox("Flip webcam horizontally (mirror)", value=True)
+
+# Load model (from uploaded file)
 @st.cache_resource
-def download_and_load_model(url, path):
-    # Download model if not exists
-    gdown.download(url, path, quiet=False)
-    # Load model
-    model = tf.keras.models.load_model(path)
+def load_keras_model_from_file(uploaded_h5):
+    if uploaded_h5 is None:
+        return None
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".h5")
+    tfile.write(uploaded_h5.read())
+    tfile.flush()
+    model = load_model(tfile.name)
     return model
 
-model = download_and_load_model(MODEL_DRIVE_LINK, MODEL_PATH)
+model = load_keras_model_from_file(model_file)
 
-# -----------------------------
-# 2. Mediapipe setup
-# -----------------------------
+# Load labels
+def load_labels(uploaded_txt):
+    if uploaded_txt is None:
+        # default: A-Z (26 classes)
+        return [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+    text = uploaded_txt.getvalue().decode("utf-8")
+    labels = [line.strip() for line in text.splitlines() if line.strip()]
+    return labels
+
+labels = load_labels(labels_file)
+
+if model is None:
+    st.warning("No model uploaded. Upload a .h5 Keras model in the sidebar to enable prediction. Using demo mode (no predictions).")
+
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    stframe = st.image([])
+    start_button = st.button("Start webcam")
+    stop_button = st.button("Stop")
+
+with col2:
+    st.subheader("Info / Prediction")
+    pred_text = st.empty()
+    fps_text = st.empty()
+    detected_box = st.empty()
+
+# Mediapipe hands setup
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
-hands = mp_hands.Hands(
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.5
-)
+running = False
 
-# -----------------------------
-# 3. Streamlit UI
-# -----------------------------
-st.title("Real-Time Hand Gesture Recognition")
-st.write("Take a picture or stream frames for gesture prediction:")
+if start_button:
+    running = True
+if stop_button:
+    running = False
 
-# Camera input (single-frame)
-img_file_buffer = st.camera_input("Capture frame")
+# We'll use session state to persist running state between reruns
+if "running" not in st.session_state:
+    st.session_state.running = False
 
-if img_file_buffer is not None:
-    # Convert to OpenCV image
-    frame = np.array(Image.open(img_file_buffer))
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+if start_button:
+    st.session_state.running = True
+if stop_button:
+    st.session_state.running = False
 
-    # Mediapipe processing
-    results = hands.process(frame_rgb)
+# Main loop: capture frames and run detection
+if st.session_state.running:
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        st.error("Could not open webcam. Make sure your browser/device gives permission and no other app is using the camera.")
+    else:
+        hands = mp_hands.Hands(static_image_mode=False,
+                               max_num_hands=1,
+                               min_detection_confidence=0.5,
+                               min_tracking_confidence=0.5)
+        prev_time = time.time()
+        # smoothing for prediction
+        from collections import deque
+        pred_buffer = deque(maxlen=8)
 
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        while st.session_state.running and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                st.warning("Empty frame from webcam. Retrying...")
+                break
 
-            # Prepare landmarks for model
-            landmarks = []
-            for lm in hand_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y, lm.z])
-            landmarks = np.array(landmarks).reshape(1, -1)
+            if flip_image:
+                frame = cv2.flip(frame, 1)
 
-            # Predict gesture
-            prediction = model.predict(landmarks)
-            predicted_class = np.argmax(prediction, axis=1)[0]
+            # convert to RGB for mediapipe
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb)
 
-            st.write(f"Predicted Gesture Class: {predicted_class}")
+            h, w, _ = frame.shape
+            # default annotation
+            annotated = frame.copy()
+            prediction_label = "-"
+            prediction_conf = 0.0
 
-    st.image(frame, caption='Processed Frame', use_column_width=True)
+            if results.multi_hand_landmarks:
+                # draw landmarks
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(annotated, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
+                # compute bounding box around landmarks
+                lm = results.multi_hand_landmarks[0]
+                xs = [pt.x for pt in lm.landmark]
+                ys = [pt.y for pt in lm.landmark]
+                x_min = int(max(0, min(xs) * w) - 20)
+                x_max = int(min(w, max(xs) * w) + 20)
+                y_min = int(max(0, min(ys) * h) - 20)
+                y_max = int(min(h, max(ys) * h) + 20)
 
+                # crop and prepare for model
+                crop = frame[y_min:y_max, x_min:x_max]
+                if crop.size != 0 and model is not None:
+                    try:
+                        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                        img = cv2.resize(crop_rgb, (input_size, input_size))
+                        img = img.astype(np.float32) / 255.0
+                        img = np.expand_dims(img, axis=0)
+                        preds = model.predict(img)
+                        if preds.ndim == 1 or preds.shape[1] == 1:
+                            # regression or single output -- not supported here
+                            pred_label = "?"
+                            pred_conf = 0.0
+                        else:
+                            pred_idx = int(np.argmax(preds[0]))
+                            pred_conf = float(np.max(preds[0]))
+                            if pred_conf >= conf_threshold and pred_idx < len(labels):
+                                prediction_label = labels[pred_idx]
+                                prediction_conf = pred_conf
+                            else:
+                                prediction_label = "(low conf)"
+                                prediction_conf = pred_conf
 
-# # ui/app.py
-# import streamlit as st
-# import os
-# import cv2
-# import numpy as np
-# from collections import deque, Counter
-# import time
-# from tensorflow.keras.models import load_model
-# from tensorflow.keras.applications.resnet50 import preprocess_input
-# from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
-# import requests
+                        pred_buffer.append(prediction_label)
+                        # voting
+                        if len(pred_buffer) > 0:
+                            most_common = max(set(pred_buffer), key=pred_buffer.count)
+                        else:
+                            most_common = prediction_label
 
-# st.set_page_config(page_title="ASL Real-Time Demo", layout="wide")
-# st.title("ASL Real-Time Demo (Full Frame, No MediaPipe)")
+                        # draw bbox and label
+                        cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                        cv2.putText(annotated, f"{most_common} {prediction_conf:.2f}", (x_min, y_min - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    except Exception as e:
+                        cv2.putText(annotated, f"Model error", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                        st.error(f"Prediction error: {e}")
 
-# # -------------------------
-# # Config
-# # -------------------------
-# LETTERS_DRIVE_URL = "https://drive.google.com/uc?export=download&id=1gnqGeqa-tU5WDACv38Az13LZqxYnloEZ"
-# MODEL_PATH = "/tmp/letters_model.h5"
-# CONF_THRESHOLD = 0.6
-# SMOOTH_WINDOW = 8
+            # show fps
+            curr_time = time.time()
+            fps = 1.0 / (curr_time - prev_time) if curr_time != prev_time else 0.0
+            prev_time = curr_time
 
-# CLASS_LABELS = {
-#      0:'A',  1:'B',  2:'C',  3:'D',  4:'E',  5:'F',  6:'G',  7:'H',  8:'I',  9:'J',
-#     10:'K', 11:'L', 12:'M', 13:'N', 14:'O', 15:'P', 16:'Q', 17:'R', 18:'S', 19:'T',
-#     20:'U', 21:'V', 22:'W', 23:'X', 24:'Y', 25:'Z', 26:'del', 27:'nothing', 28:'space'
-# }
+            stframe.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), channels="RGB")
+            pred_text.markdown(f"**Prediction:** {prediction_label}  
+                        **Confidence:** {prediction_conf:.2f}")
+            fps_text.markdown(f"**FPS:** {fps:.1f}")
+            detected_box.markdown(f"**Hand box:** x={x_min},{x_max} y={y_min},{y_max}")
 
-# # -------------------------
-# # Download model if needed
-# # -------------------------
-# if not os.path.exists(MODEL_PATH):
-#     st.info("Downloading letters model from Google Drive...")
-#     r = requests.get(LETTERS_DRIVE_URL, stream=True)
-#     with open(MODEL_PATH, "wb") as f:
-#         for chunk in r.iter_content(chunk_size=8192):
-#             if chunk:
-#                 f.write(chunk)
-#     st.success("Model downloaded!")
+            # small sleep to reduce CPU usage
+            key = cv2.waitKey(1)
+            if key == 27:
+                break
 
-# # -------------------------
-# # Load model
-# # -------------------------
-# model = load_model(MODEL_PATH)
-# IMG_H, IMG_W, IMG_C = model.input_shape[1:4]
-# st.success(f"Model loaded: {IMG_H}x{IMG_W}x{IMG_C}")
+        cap.release()
+        hands.close()
+        st.session_state.running = False
+else:
+    st.info("Press 'Start webcam' to begin. Upload a model in the sidebar for live predictions.")
 
-# # -------------------------
-# # Sidebar
-# # -------------------------
-# st.sidebar.header("Controls")
-# model_option = st.sidebar.radio("Select model", ("letters", "words (under development)"))
-# show_fps = st.sidebar.checkbox("Show FPS", True)
-# tts_enabled = st.sidebar.checkbox("Enable Text-to-Speech", True)
-
-# if model_option.startswith("letters"):
-#     use_model = "letters"
-# else:
-#     use_model = None
-#     st.sidebar.warning("⚠ Word model is under development and not available yet.")
-
-# # -------------------------
-# # Preprocessing helper
-# # -------------------------
-# def preprocess_frame(frame):
-#     # Resize
-#     img = cv2.resize(frame, (IMG_W, IMG_H))
-#     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-#     img_arr = preprocess_input(np.expand_dims(img.astype("float32"), axis=0))
-#     return img_arr
-
-# # -------------------------
-# # Text-to-Speech helper
-# # -------------------------
-# import streamlit.components.v1 as components
-# def speak_label_js(label):
-#     if not label:
-#         return ""
-#     safe_label = str(label).replace('"', '\\"')
-#     js = f"""
-#     <script>
-#       var msg = new SpeechSynthesisUtterance("{safe_label}");
-#       window.speechSynthesis.speak(msg);
-#     </script>
-#     """
-#     return js
-
-# # Session state for smoothing & TTS
-# if "pred_history" not in st.session_state:
-#     st.session_state.pred_history = deque(maxlen=SMOOTH_WINDOW)
-# if "last_pred" not in st.session_state:
-#     st.session_state.last_pred = None
-
-# # -------------------------
-# # Video Transformer
-# # -------------------------
-# RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-
-# class VideoTransformer(VideoTransformerBase):
-#     def __init__(self):
-#         self.last_time = 0
-#         self.fps = 0.0
-
-#     def transform(self, frame):
-#         img = frame.to_ndarray(format="bgr24")
-#         label = "nothing"
-#         conf = 0.0
-
-#         if use_model:
-#             inp = preprocess_frame(img)
-#             preds = model.predict(inp, verbose=0)[0]
-#             conf = float(np.max(preds))
-#             idx = int(np.argmax(preds))
-#             label = CLASS_LABELS[idx] if conf >= CONF_THRESHOLD else "nothing"
-
-#             # smoothing
-#             st.session_state.pred_history.append(label)
-#             stable_label = Counter(st.session_state.pred_history).most_common(1)[0][0]
-#         else:
-#             stable_label = "N/A"
-
-#         # Draw label and FPS
-#         h, w, _ = img.shape
-#         cv2.putText(img, f"Pred: {label} ({conf*100:.1f}%)", (10,30),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-#         cv2.putText(img, f"Stable: {stable_label}", (10,70),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
-
-#         if show_fps:
-#             ctime = time.time()
-#             if self.last_time != 0:
-#                 self.fps = 0.9*self.fps + 0.1*(1/(ctime - self.last_time))
-#             self.last_time = ctime
-#             cv2.putText(img, f"FPS: {self.fps:.1f}", (10,h-20),
-#                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-
-#         # TTS
-#         if stable_label != st.session_state.last_pred and tts_enabled and use_model:
-#             st.session_state.last_pred = stable_label
-#             components.html(speak_label_js(st.session_state.last_pred), height=0)
-
-#         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-# # -------------------------
-# # Run Webcam
-# # -------------------------
-# webrtc_streamer(
-#     key="asl-camera",
-#     video_transformer_factory=VideoTransformer,
-#     rtc_configuration=RTC_CONFIGURATION,
-#     media_stream_constraints={"video": True, "audio": False},
-#     async_transform=True,
-# )
-
-# st.markdown("---")
-# st.caption("Webcam full-frame real-time ASL recognition (no MediaPipe). Word model under development.")
+st.markdown("---")
+st.markdown("**Notes / Troubleshooting**:\n\n- If webcam doesn't start, check camera permissions in your browser.\n- If your model fails to load, make sure it's a Keras .h5 file saved with `model.save('model.h5')`.\n- Adjust the input size or labels file if your model expects different dimensions or class ordering.\n- This app is a minimal demo — for production, consider using a proper backend, handling multiple clients, and optimizing model inference (e.g., TensorFlow Lite or ONNX).")
